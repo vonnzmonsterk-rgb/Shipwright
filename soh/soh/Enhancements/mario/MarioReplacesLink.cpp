@@ -705,6 +705,16 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
         }
     }
 
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (play->gameplayFrames % 10) == 0) {
+        SPDLOG_INFO("[Mario] mode {} category {} busy {} s1 {:08x} csAction {} parent {} msg {} pos {:.1f} {:.1f} {:.1f} "
+                    "mario {:.1f} {:.1f} {:.1f} action {:08x}",
+                    s.mode == Mode::Mario ? "mario" : "link", category, LinkIsBusy(play, player),
+                    player->stateFlags1, player->csAction, (void*)player->actor.parent,
+                    Message_GetState(&play->msgCtx), player->actor.world.pos.x, player->actor.world.pos.y,
+                    player->actor.world.pos.z, s.state.position[0] / s.scale, s.state.position[1] / s.scale,
+                    s.state.position[2] / s.scale, s.state.action);
+    }
+
     if (s.mode == Mode::Link) {
         TickPuppet(play, player);
         return; // Link's logic runs with the real input
