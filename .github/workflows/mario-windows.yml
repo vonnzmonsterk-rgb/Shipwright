@@ -31,22 +31,22 @@ jobs:
         retention-days: 3
 
   build-sm64-dll:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+    # Cross-compiled with llvm-mingw, the same way it was built and tested during development
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v7
-    - uses: msys2/setup-msys2@v2
-      with:
-        msystem: UCRT64
-        install: make python mingw-w64-ucrt-x86_64-gcc
+    - name: Get llvm-mingw and the SM64 decomp (for Mario's model layout)
+      run: |
+        curl -sSL -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20241119/llvm-mingw-20241119-ucrt-ubuntu-20.04-x86_64.tar.xz
+        tar -xJf llvm-mingw.tar.xz
+        echo "$PWD/llvm-mingw-20241119-ucrt-ubuntu-20.04-x86_64/bin" >> "$GITHUB_PATH"
+        git init sm64 && cd sm64
+        git fetch --depth 1 https://github.com/n64decomp/sm64.git 06ec56df7f951f88da05f468cdcacecba496145a
+        git checkout FETCH_HEAD
     - name: Build sm64.dll
       working-directory: libsm64
       run: |
-        set -x
-        which gcc python3 make
-        make lib -j4 CC=gcc LDFLAGS="-lm -shared -static"
+        make lib -j4 OS=Windows_NT CC=x86_64-w64-mingw32-clang SM64_DECOMP_DIR=$GITHUB_WORKSPACE/sm64 LDFLAGS="-lm -shared -static"
         ls -la dist
     - uses: actions/upload-artifact@v7
       with:
