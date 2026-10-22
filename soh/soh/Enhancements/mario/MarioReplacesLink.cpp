@@ -43,6 +43,8 @@ extern PlayState* gPlayState;
 
 namespace {
 
+constexpr float kPi = 3.14159265358979323846f;
+
 enum class Mode {
     Mario, // Mario's physics drive the player
     Link,  // Link's logic drives the player, Mario follows
@@ -80,6 +82,7 @@ struct State {
     Vec3f lastSetPos = {};
     int32_t healthRemainder = 0;
     bool pendingPostUpdate = false;
+    int linkTrial = 0; // frames Link's logic gets to start a climb before Mario takes back over
 
     // attacking
     ColliderCylinder attack;
@@ -100,6 +103,10 @@ alignas(16) static uint8_t sTextureChunks[kNumTextures][64 * 64 * 4];
 
 const Sm64::Api& lib() {
     return Sm64::Get();
+}
+
+void ApplyVolume() {
+    Sm64::SetVolume(CVarGetInteger(CVAR_MARIO("Audio"), 1) ? CVarGetFloat(CVAR_MARIO("Volume"), 1.0f) : 0.0f);
 }
 
 bool IsMarioActive() {
@@ -418,7 +425,7 @@ void Teardown() {
 void SyncMarioToLink(Player* player) {
     lib().set_mario_position(s.marioId, player->actor.world.pos.x * s.scale, player->actor.world.pos.y * s.scale,
                              player->actor.world.pos.z * s.scale);
-    lib().set_mario_faceangle(s.marioId, player->actor.shape.rot.y * (float)M_PI / 32768.0f);
+    lib().set_mario_faceangle(s.marioId, player->actor.shape.rot.y * kPi / 32768.0f);
 }
 
 bool EnsureScene(PlayState* play, Player* player) {
@@ -469,9 +476,10 @@ bool EnsureScene(PlayState* play, Player* player) {
             SyncMarioToLink(player);
             lib().set_mario_health(s.marioId, Sm64::FULL_HEALTH);
             s.lastSetPos = player->actor.world.pos;
-            if (CVarGetInteger(CVAR_MARIO("Audio"), 1)) {
-                Sm64::StartAudio();
-            }
+            // Always start SM64's sound system: its code assumes it is set up (stopping a sound before it is
+            // set up loops forever). "Voice and Sounds" off just mutes it.
+            Sm64::StartAudio();
+            ApplyVolume();
         }
     }
 
@@ -484,10 +492,10 @@ bool EnsureScene(PlayState* play, Player* player) {
 
 int TicksThisFrame() {
     // OoT's logic runs at 20 frames per second (R_UPDATE_RATE 3), SM64 at 30
-    float rate = R_UPDATE_RATE > 0 ? R_UPDATE_RATE : 3;
+    float rate = (float)(R_UPDATE_RATE > 0 ? R_UPDATE_RATE : 3);
     s.tickAccumulator += 30.0f * rate / 60.0f;
     int ticks = (int)s.tickAccumulator;
-    s.tickAccumulator -= ticks;
+    s.tickAccumulator -= (float)ticks;
     return ticks > 3 ? 3 : ticks;
 }
 
@@ -520,7 +528,7 @@ void ConvertMarioHealth(PlayState* play) {
         int units = s.healthRemainder / 0x40;
         s.healthRemainder -= units * 0x40;
         if (units > 0 && gSaveContext.health > 0) {
-            Health_ChangeBy(play, -units);
+            Health_ChangeBy(play, (s16)-units);
         }
     }
     lib().set_mario_health(s.marioId, Sm64::FULL_HEALTH);
@@ -531,7 +539,7 @@ void ApplyMarioToLink(Player* player) {
     player->actor.world.pos.y = s.state.position[1] / s.scale;
     player->actor.world.pos.z = s.state.position[2] / s.scale;
 
-    s16 yaw = (s16)(s.state.faceAngle * 32768.0f / (float)M_PI);
+    s16 yaw = (s16)(s.state.faceAngle * 32768.0f / kPi);
     player->actor.shape.rot.y = yaw;
     player->actor.world.rot.y = yaw;
     player->yaw = yaw;
@@ -539,6 +547,10 @@ void ApplyMarioToLink(Player* player) {
     player->actor.velocity.x = player->actor.velocity.y = player->actor.velocity.z = 0.0f;
     player->actor.speedXZ = 0.0f;
     player->linearVelocity = 0.0f;
+
+    // Link's update treats home.pos as last frame's position and sweeps for walls from there
+    player->actor.home.pos = player->actor.world.pos;
+    player->actor.prevPos = player->actor.world.pos;
 
     // Mario takes his own fall damage; don't let Link take it too
     player->fallStartHeight = (s16)player->actor.world.pos.y;
@@ -566,10 +578,9 @@ bool IsLinkDoAction(u16 doAction) {
 }
 
 // Ladders, vines and crawlspaces need Link's logic to start. When Mario pushes into one, the stick is passed to Link.
-bool WantsLinkClimbAssist(PlayState* play, Player* player, const Input& raw) {
-    if (player->actor.wallPoly == nullptr || !(player->actor.bgCheckFlags & BGCHECKFLAG_WALL)) {
-        return false;
-    }
+// Ladders, vines and crawlspaces need Link's logic to start. Looks for one right in front of Mario while the
+// stick pushes into it. On success, *faceYaw is the yaw that faces the wall.
+bool WantsLinkClimbAssist(PlayState* play, Player* player, const Input& raw, s16* faceYaw) {
     uint32_t group = s.state.action & Sm64::ACT_GROUP_MASK;
     if (group != Sm64::ACT_GROUP_STATIONARY && group != Sm64::ACT_GROUP_MOVING) {
         return false;
@@ -578,13 +589,53 @@ bool WantsLinkClimbAssist(PlayState* play, Player* player, const Input& raw) {
     if (mag < 40 * 40) {
         return false;
     }
-    s32 flags = SurfaceType_GetWallFlags(&play->colCtx, player->actor.wallPoly, player->actor.wallBgId);
-    if (!(flags & (WALL_FLAG_CLIMBABLE | WALL_FLAG_LADDER | WALL_FLAG_CRAWLSPACE))) {
-        return false;
+    s16 yaw = player->actor.shape.rot.y;
+    for (float h : { 10.0f, 25.0f }) {
+        Vec3f from = { player->actor.world.pos.x, player->actor.world.pos.y + h, player->actor.world.pos.z };
+        Vec3f to = { from.x + Math_SinS(yaw) * 30.0f, from.y, from.z + Math_CosS(yaw) * 30.0f };
+        Vec3f hit;
+        CollisionPoly* poly = nullptr;
+        s32 bgId;
+        if (!BgCheck_EntityLineTest1(&play->colCtx, &from, &to, &hit, &poly, true, false, false, true, &bgId) ||
+            poly == nullptr) {
+            continue;
+        }
+        s32 flags = SurfaceType_GetWallFlags(&play->colCtx, poly, bgId);
+        if (!(flags & (WALL_FLAG_CLIMBABLE | WALL_FLAG_LADDER | WALL_FLAG_CRAWLSPACE)) &&
+            !func_80041E4C(&play->colCtx, poly, bgId)) {
+            continue;
+        }
+        s16 wallYaw = Math_Atan2S(poly->normal.z, poly->normal.x);
+        s16 diff = (s16)(wallYaw + 0x8000) - yaw;
+        if (ABS(diff) < 0x3000) {
+            *faceYaw = (s16)(wallYaw + 0x8000);
+            return true;
+        }
     }
-    s16 towardWall = player->actor.wallYaw + 0x8000;
-    s16 diff = towardWall - player->actor.shape.rot.y;
-    return ABS(diff) < 0x3000;
+
+    // A ladder or vine going down from the edge in front of Mario: look back toward him from just past the edge,
+    // below his feet, for a climbable wall facing away from him
+    {
+        Vec3f from = { player->actor.world.pos.x + Math_SinS(yaw) * 20.0f, player->actor.world.pos.y - 20.0f,
+                       player->actor.world.pos.z + Math_CosS(yaw) * 20.0f };
+        Vec3f to = { player->actor.world.pos.x - Math_SinS(yaw) * 5.0f, from.y,
+                     player->actor.world.pos.z - Math_CosS(yaw) * 5.0f };
+        Vec3f hit;
+        CollisionPoly* poly = nullptr;
+        s32 bgId;
+        if (BgCheck_EntityLineTest1(&play->colCtx, &from, &to, &hit, &poly, true, false, false, true, &bgId) &&
+            poly != nullptr) {
+            s32 flags = SurfaceType_GetWallFlags(&play->colCtx, poly, bgId);
+            s16 wallYaw = Math_Atan2S(poly->normal.z, poly->normal.x);
+            s16 diff = wallYaw - yaw;
+            if (((flags & (WALL_FLAG_CLIMBABLE | WALL_FLAG_LADDER)) || func_80041E4C(&play->colCtx, poly, bgId)) &&
+                ABS(diff) < 0x3000) {
+                *faceYaw = wallYaw; // walk off the edge facing away from the wall; Link turns around and climbs
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 SM64MarioInputs InputsFromController(PlayState* play, const Input& raw, bool giveA) {
@@ -592,6 +643,11 @@ SM64MarioInputs InputsFromController(PlayState* play, const Input& raw, bool giv
     Camera* cam = GET_ACTIVE_CAM(play);
     in.camLookX = cam->at.x - cam->eye.x;
     in.camLookZ = cam->at.z - cam->eye.z;
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && CVarGetInteger(CVAR_MARIO("DebugFixedControls"), 0)) {
+        // Debug: stick up always moves toward +Z, right toward -X (for scripted testing)
+        in.camLookX = 0.0f;
+        in.camLookZ = 1.0f;
+    }
     in.stickX = raw.cur.stick_x / 80.0f;
     in.stickY = -raw.cur.stick_y / 80.0f;
     float mag = sqrtf(in.stickX * in.stickX + in.stickY * in.stickY);
@@ -656,6 +712,19 @@ bool LinkIsBusy(PlayState* play, Player* player) {
 void OnPlayerUpdateCommon(Player* player, Input* input) {
     PlayState* play = gPlayState;
     s.pendingPostUpdate = false;
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) > 1) {
+        SPDLOG_INFO("[Mario] frame {} stick {} {}", play->gameplayFrames, input->cur.stick_x, input->cur.stick_y);
+    }
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && CVarGetInteger(CVAR_MARIO("DebugWorldStickYaw"), -1) >= 0) {
+        // Debug: any held stick points toward a fixed world yaw, for both Mario and Link (scripted testing)
+        int mag2 = input->cur.stick_x * input->cur.stick_x + input->cur.stick_y * input->cur.stick_y;
+        if (mag2 > 30 * 30) {
+            s16 a = (s16)CVarGetInteger(CVAR_MARIO("DebugWorldStickYaw"), 0) - Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+            s8 sx = (s8)(-80.0f * Math_SinS(a)), sy = (s8)(80.0f * Math_CosS(a));
+            input->cur.stick_x = input->rel.stick_x = sx;
+            input->cur.stick_y = input->rel.stick_y = sy;
+        }
+    }
 
     if (!EnsureScene(play, player)) {
         return;
@@ -678,7 +747,7 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
     if (s.mode == Mode::Mario) {
         if (category == PLAYER_MARIO_ACTION_DAMAGE) {
             // Link was hit: Mario does his own knockback, away from where Link would have been pushed from
-            float yaw = player->actor.world.rot.y * (float)M_PI / 32768.0f;
+            float yaw = player->actor.world.rot.y * kPi / 32768.0f;
             float src[3] = { s.state.position[0] - sinf(yaw) * 100.0f, s.state.position[1],
                              s.state.position[2] - cosf(yaw) * 100.0f };
             uint32_t subtype = player->actor.colChkInfo.damage >= 8 ? Sm64::INT_SUBTYPE_BIG_KNOCKBACK : 0;
@@ -700,12 +769,20 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
     } else {
         bool linkFree = (category == PLAYER_MARIO_ACTION_GROUND || category == PLAYER_MARIO_ACTION_SETTLE) &&
                     !LinkIsBusy(play, player) && Message_GetState(&play->msgCtx) == TEXT_STATE_NONE;
+        if (s.linkTrial > 0) {
+            s.linkTrial--;
+            if (category == PLAYER_MARIO_ACTION_LINK || LinkIsBusy(play, player)) {
+                s.linkTrial = 0; // the climb started; stay with Link until he is free again
+            } else {
+                linkFree = false;
+            }
+        }
         if (linkFree) {
             EnterMarioMode(player);
         }
     }
 
-    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (play->gameplayFrames % 10) == 0) {
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && ((play->gameplayFrames % 10) == 0 || CVarGetInteger(CVAR_MARIO("Debug"), 0) > 1)) {
         SPDLOG_INFO("[Mario] mode {} category {} busy {} s1 {:08x} csAction {} parent {} msg {} pos {:.1f} {:.1f} {:.1f} "
                     "mario {:.1f} {:.1f} {:.1f} action {:08x}",
                     s.mode == Mode::Mario ? "mario" : "link", category, LinkIsBusy(play, player),
@@ -727,7 +804,22 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
     bool holdA = CHECK_BTN_ALL(raw.cur.button, BTN_A) && doAction == DO_ACTION_GRAB;
     bool passC = CHECK_BTN_ANY(raw.press.button, BTN_CLEFT | BTN_CDOWN | BTN_CRIGHT | BTN_CUP | BTN_DUP |
                                                      BTN_DDOWN | BTN_DLEFT | BTN_DRIGHT);
-    bool assist = WantsLinkClimbAssist(play, player, raw);
+    s16 faceYaw;
+    bool climbAssist = WantsLinkClimbAssist(play, player, raw, &faceYaw);
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (raw.cur.stick_x != 0 || raw.cur.stick_y != 0)) {
+        SPDLOG_INFO("[Mario] input stick {} {} climbAssist {} action {:08x} trial {}", raw.cur.stick_x,
+                    raw.cur.stick_y, climbAssist, s.state.action, s.linkTrial);
+    }
+    if (climbAssist) {
+        // Hand the controls to Link for a moment so OoT starts the climb the way it normally does
+        player->actor.shape.rot.y = player->actor.world.rot.y = player->yaw = faceYaw;
+        player->actor.home.pos = player->actor.prevPos = player->actor.world.pos;
+        Player_MarioForceIdle(play, player);
+        s.mode = Mode::Link;
+        s.linkTrial = 15;
+        return;
+    }
+    bool assist = false;
 
     UpdateWaterLevel(play, player);
     SM64MarioInputs in = InputsFromController(play, raw, !(passA || holdA));
@@ -750,9 +842,18 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
     }
 
     s.handedToLink = passA || holdA || passC || assist;
+
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (play->gameplayFrames % 5) == 0 && player->actor.wallPoly != nullptr) {
+        SPDLOG_INFO("[Mario] wall: bgflags {:04x} wallflags {:x} wallYaw {} rotY {} ledge {:.1f} assist {} lv {:.1f} "
+                    "action {:08x} stick {} {}",
+                    player->actor.bgCheckFlags,
+                    SurfaceType_GetWallFlags(&play->colCtx, player->actor.wallPoly, player->actor.wallBgId),
+                    player->actor.wallYaw, player->actor.shape.rot.y, player->yDistToLedge, assist,
+                    player->linearVelocity, s.state.action, raw.cur.stick_x, raw.cur.stick_y);
+    }
     s.pendingPostUpdate = true;
 
-    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (play->gameplayFrames % 10) == 0) {
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && ((play->gameplayFrames % 10) == 0 || CVarGetInteger(CVAR_MARIO("Debug"), 0) > 1)) {
         s32 exitIdx = player->actor.floorPoly != nullptr
                           ? SurfaceType_GetSceneExitIndex(&play->colCtx, player->actor.floorPoly, player->actor.floorBgId)
                           : -1;
@@ -800,7 +901,7 @@ void UpdateAttack(PlayState* play, Player* player) {
         return;
     }
 
-    float forward = 14.0f, radius = 16.0f, height = 30.0f;
+    float forward = 16.0f, radius = 20.0f, height = 55.0f;
     u32 dmgFlags = DMG_SLASH_KOKIRI;
     u8 damage = 1;
 
@@ -971,7 +1072,7 @@ static void DrawMario(PlayState* play, Player* player) {
                 v->v.flag = 0;
 
                 if (tex >= 0) {
-                    float local = sUvs[vi * 2 + 0] * kNumTextures - tex;
+                    float local = sUvs[vi * 2 + 0] * (float)kNumTextures - (float)tex;
                     v->v.tc[0] = (s16)lrintf(local * 64.0f * 32.0f);
                     v->v.tc[1] = (s16)lrintf(sUvs[vi * 2 + 1] * 64.0f * 32.0f);
                 } else {
@@ -1070,7 +1171,7 @@ void RegisterMarioReplacesLink() {
         Teardown();
         Sm64::StopAudio();
     } else {
-        Sm64::SetVolume(CVarGetFloat(CVAR_MARIO("Volume"), 1.0f));
+        ApplyVolume();
     }
 
     COND_VB_SHOULD(VB_PLAYER_UPDATE_COMMON, enabled, {
@@ -1100,7 +1201,7 @@ void RegisterMarioReplacesLink() {
 }
 
 static RegisterShipInitFunc initFunc(RegisterMarioReplacesLink,
-                                     { CVAR_MARIO_ENABLED_NAME, CVAR_MARIO("Size"), CVAR_MARIO("Volume") });
+                                     { CVAR_MARIO_ENABLED_NAME, CVAR_MARIO("Size"), CVAR_MARIO("Volume"), CVAR_MARIO("Audio") });
 
 } // namespace
 
