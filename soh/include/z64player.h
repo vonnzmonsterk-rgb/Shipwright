@@ -955,4 +955,23 @@ typedef struct Player {
     // #endregion
 } Player; // size = 0xA94
 
+
+// SoH [Mario Replaces Link]
+typedef enum PlayerMarioActionCategory {
+    PLAYER_MARIO_ACTION_GROUND,
+    PLAYER_MARIO_ACTION_SETTLE,
+    PLAYER_MARIO_ACTION_DAMAGE,
+    PLAYER_MARIO_ACTION_LEDGE,
+    PLAYER_MARIO_ACTION_LINK,
+} PlayerMarioActionCategory;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+s32 Player_GetMarioActionCategory(Player* player);
+void Player_MarioForceIdle(struct PlayState* play, Player* player);
+#ifdef __cplusplus
+}
+#endif
+
 #endif

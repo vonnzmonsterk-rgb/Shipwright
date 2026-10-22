@@ -38,6 +38,9 @@ void disableBetaQuest() {
 }
 }
 
+extern "C" const char* Mario_GetStatus();
+extern "C" void Mario_RetryLoad();
+
 namespace SohGui {
 
 extern std::shared_ptr<SohMenu> mSohMenu;
@@ -197,6 +200,40 @@ static WidgetFunc HideQuestPreFunc(Quest quest) {
 void SohMenu::AddMenuEnhancements() {
     // Add Enhancements Menu
     AddMenuEntry("Enhancements", CVAR_SETTING("Menu.EnhancementsSidebarSection"));
+
+    // Super Mario 64
+    WidgetPath marioPath = { "Enhancements", "Super Mario 64", SECTION_COLUMN_1 };
+    AddSidebarEntry("Enhancements", marioPath.sidebarName, 2);
+    AddWidget(marioPath, "Mario", WIDGET_SEPARATOR_TEXT);
+    AddWidget(marioPath, "Play as Mario", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Mario.Enabled"))
+        .Options(CheckboxOptions().Tooltip(
+            "Replaces Link with Mario from Super Mario 64, with his full moveset.\n\n"
+            "A: jump (triple jumps, long jumps, backflips, wall kicks)\n"
+            "B: punch / kick / dive\n"
+            "Z or R: crouch, ground pound, slide kick\n"
+            "C buttons: Link's items as usual\n\n"
+            "A still talks, opens doors and chests when the A button shows that action. "
+            "Walk into ladders, vines and crawlspaces to use them.\n\n"
+            "Needs sm64.dll and your Super Mario 64 (USA) ROM, named sm64.us.z64, next to the game."));
+    AddWidget(marioPath, "Status", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
+        info.name = std::string("Status: ") + Mario_GetStatus();
+        info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("Mario.Enabled"), 0);
+    });
+    AddWidget(marioPath, "Look for the ROM again", WIDGET_BUTTON)
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !CVarGetInteger(CVAR_ENHANCEMENT("Mario.Enabled"), 0); })
+        .Callback([](WidgetInfo& info) { Mario_RetryLoad(); })
+        .Options(ButtonOptions().Tooltip("Use this after putting sm64.us.z64 next to the game."));
+    AddWidget(marioPath, "Mario Size: %.2fx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("Mario.Size"))
+        .Options(FloatSliderOptions().Min(0.5f).Max(2.0f).DefaultValue(1.0f).Format("%.2fx").Tooltip(
+            "How big Mario is compared to Link. Bigger also means his jumps reach higher in OoT's world."));
+    AddWidget(marioPath, "Mario Voice and Sounds", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Mario.Audio"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip("Play Mario's voice and sound effects from SM64."));
+    AddWidget(marioPath, "Mario Volume: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar(CVAR_ENHANCEMENT("Mario.Volume"))
+        .Options(FloatSliderOptions().Min(0.0f).Max(1.0f).DefaultValue(1.0f).Format("%.2f"));
 
     // Quality of Life
     WidgetPath path = { "Enhancements", "Quality of Life", SECTION_COLUMN_1 };

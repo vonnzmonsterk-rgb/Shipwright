@@ -796,12 +796,30 @@ typedef enum {
 
     // #### `result`
     // ```c
+    // true
+    // ```
+    // #### `args`
+    // - `*Player`
+    // - `int32_t` (true when drawing the reflection) (promoted from `bool` by va_arg)
+    VB_DRAW_PLAYER_MODEL,
+
+    // #### `result`
+    // ```c
     // !(this->stateFlags3 & PLAYER_STATE3_PAUSE_ACTION_FUNC)
     // ```
     // #### `args`
     // - `*Player`
     // - `*Input`
     VB_EXECUTE_PLAYER_ACTION_FUNC,
+
+    // #### `result`
+    // ```c
+    // true
+    // ```
+    // #### `args`
+    // - `*Player`
+    // - `*Input` (the input Link's update will use, may be modified)
+    VB_PLAYER_UPDATE_COMMON,
 
     // #### `result`
     // ```c

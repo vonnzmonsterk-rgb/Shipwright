@@ -12248,7 +12248,9 @@ void Player_Update(Actor* thisx, PlayState* play) {
             }
         }
 
-        Player_UpdateCommon(this, play, &input);
+        if (GameInteractor_Should(VB_PLAYER_UPDATE_COMMON, true, this, &input)) {
+            Player_UpdateCommon(this, play, &input);
+        }
     }
 
     MREG(52) = this->actor.world.pos.x;
@@ -12429,6 +12431,74 @@ void Player_DrawGameplay(PlayState* play, Player* this, s32 lod, Gfx* cullDList,
     CLOSE_DISPS(play->state.gfxCtx);
 }
 
+// SoH [Mario Replaces Link]: runs Link's skeleton draw into a throwaway display list. Link stays invisible, but
+// everything the skeleton draw computes (hand and feet positions, held item positions, shadows) stays up to date.
+static Gfx sHiddenPlayerDisps[3][0x2000];
+
+void Player_DrawGameplayHidden(PlayState* play, Player* this, s32 lod, Gfx* cullDList,
+                               OverrideLimbDrawOpa overrideLimbDraw) {
+    GraphicsContext* gfxCtx = play->state.gfxCtx;
+    Gfx* opa = gfxCtx->polyOpa.p;
+    Gfx* xlu = gfxCtx->polyXlu.p;
+    Gfx* ovl = gfxCtx->overlay.p;
+
+    gfxCtx->polyOpa.p = sHiddenPlayerDisps[0];
+    gfxCtx->polyXlu.p = sHiddenPlayerDisps[1];
+    gfxCtx->overlay.p = sHiddenPlayerDisps[2];
+
+    Player_DrawGameplay(play, this, lod, cullDList, overrideLimbDraw);
+
+    gfxCtx->polyOpa.p = opa;
+    gfxCtx->polyXlu.p = xlu;
+    gfxCtx->overlay.p = ovl;
+}
+
+// SoH [Mario Replaces Link]: tells the Mario enhancement which kind of action Link is in
+s32 Player_GetMarioActionCategory(Player* this) {
+    PlayerActionFunc f = this->actionFunc;
+
+    // Standing, walking, running and turning: Mario moves, Link's logic only watches for interactions
+    if ((f == Player_Action_Idle) || (f == Player_Action_80840450) || (f == Player_Action_808407CC) ||
+        (f == Player_Action_80840DE4) || (f == Player_Action_808414F8) || (f == Player_Action_8084170C) ||
+        (f == Player_Action_808417FC) || (f == Player_Action_8084193C) || (f == Player_Action_TurnInPlace) ||
+        (f == Player_Action_80842180) || (f == Player_Action_8084227C) || (f == Player_Action_808423EC) ||
+        (f == Player_Action_8084251C)) {
+        return PLAYER_MARIO_ACTION_GROUND;
+    }
+
+    // Falling, landing, rolling, sliding and swimming: Mario moves, Link's logic settles back to standing
+    if ((f == Player_Action_8084411C) || (f == Player_Action_80844A44) || (f == Player_Action_Roll) ||
+        (f == Player_Action_SlideOnSlope) || (f == Player_Action_8084D610) || (f == Player_Action_8084D7C4) ||
+        (f == Player_Action_8084D84C) || (f == Player_Action_8084DAB4) || (f == Player_Action_8084DC48)) {
+        return PLAYER_MARIO_ACTION_SETTLE;
+    }
+
+    // Getting hit and knocked back: Mario plays his own knockback instead
+    if ((f == Player_Action_8084370C) || (f == Player_Action_8084377C) || (f == Player_Action_80843954) ||
+        (f == Player_Action_80843A38)) {
+        return PLAYER_MARIO_ACTION_DAMAGE;
+    }
+
+    // Grabbing onto a ledge or stepping up onto one: Mario has his own ledge grabs and jumps
+    if ((f == Player_Action_8084BBE4) || (f == Player_Action_80845668)) {
+        return PLAYER_MARIO_ACTION_LEDGE;
+    }
+
+    // Everything else (talking, doors, chests, items, ladders, cutscenes, ...) is driven by Link's logic
+    return PLAYER_MARIO_ACTION_LINK;
+}
+
+// SoH [Mario Replaces Link]: drops Link back into standing still
+void Player_MarioForceIdle(PlayState* play, Player* this) {
+    this->stateFlags1 &= ~(PLAYER_STATE1_HANGING_OFF_LEDGE | PLAYER_STATE1_CLIMBING_LEDGE | PLAYER_STATE1_DAMAGED |
+                           PLAYER_STATE1_JUMPING | PLAYER_STATE1_FREEFALL);
+    this->stateFlags3 &= ~PLAYER_STATE3_MIDAIR;
+    this->actor.velocity.x = this->actor.velocity.y = this->actor.velocity.z = 0.0f;
+    this->actor.speedXZ = 0.0f;
+    this->linearVelocity = 0.0f;
+    func_8083C0E8(this, play);
+}
+
 void Player_Draw(Actor* thisx, PlayState* play2) {
     PlayState* play = play2;
     Player* this = (Player*)thisx;
@@ -12516,7 +12586,11 @@ void Player_Draw(Actor* thisx, PlayState* play2) {
             Matrix_Scale(1.1f, 0.95f, 1.05f, MTXMODE_APPLY);
             Matrix_RotateY(-sp74, MTXMODE_APPLY);
             Matrix_RotateX(-sp78, MTXMODE_APPLY);
-            Player_DrawGameplay(play, this, lod, gCullFrontDList, overrideLimbDraw);
+            if (GameInteractor_Should(VB_DRAW_PLAYER_MODEL, true, this, true)) {
+                Player_DrawGameplay(play, this, lod, gCullFrontDList, overrideLimbDraw);
+            } else {
+                Player_DrawGameplayHidden(play, this, lod, gCullFrontDList, overrideLimbDraw);
+            }
             this->actor.scale.y = -this->actor.scale.y;
             Matrix_Pop();
         }
@@ -12524,7 +12598,11 @@ void Player_Draw(Actor* thisx, PlayState* play2) {
         gSPClearGeometryMode(POLY_OPA_DISP++, G_CULL_BOTH);
         gSPClearGeometryMode(POLY_XLU_DISP++, G_CULL_BOTH);
 
-        Player_DrawGameplay(play, this, lod, gCullBackDList, overrideLimbDraw);
+        if (GameInteractor_Should(VB_DRAW_PLAYER_MODEL, true, this, false)) {
+            Player_DrawGameplay(play, this, lod, gCullBackDList, overrideLimbDraw);
+        } else {
+            Player_DrawGameplayHidden(play, this, lod, gCullBackDList, overrideLimbDraw);
+        }
 
         if (this->invincibilityTimer > 0) {
             POLY_OPA_DISP = Play_SetFog(play, POLY_OPA_DISP);
