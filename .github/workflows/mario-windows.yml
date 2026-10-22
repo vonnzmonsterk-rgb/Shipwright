@@ -113,7 +113,7 @@ jobs:
         4. Press F1 (or Back/Select on a controller) to open the menu, go to
            Enhancements > Super Mario 64 and tick "Play as Mario".
 
-        Controls: A jump, B punch/kick/dive, Z or R crouch / ground pound / slide kick,
+        Controls: A jump, B punch/kick/dive, R crouch / ground pound / slide kick, Z Z-targeting,
         C buttons use Link's items. A still talks and opens doors/chests when the A prompt says so.
         Walk into ladders, vines and crawlspaces to use them.
         "@ | Out-File -Encoding utf8 soh-mario-windows/README-MARIO.txt

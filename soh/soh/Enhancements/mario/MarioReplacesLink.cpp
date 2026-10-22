@@ -657,7 +657,8 @@ SM64MarioInputs InputsFromController(PlayState* play, const Input& raw, bool giv
     }
     in.buttonA = giveA && CHECK_BTN_ALL(raw.cur.button, BTN_A);
     in.buttonB = CHECK_BTN_ALL(raw.cur.button, BTN_B);
-    in.buttonZ = CHECK_BTN_ANY(raw.cur.button, BTN_Z | BTN_R);
+    // R is Mario's Z button (crouch, ground pound, slide kick); OoT's Z stays with Link for Z-targeting
+    in.buttonZ = CHECK_BTN_ALL(raw.cur.button, BTN_R);
     return in;
 }
 
@@ -822,13 +823,19 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
     bool assist = false;
 
     UpdateWaterLevel(play, player);
+    // Z-targeting: while standing still, Mario turns to face the target
+    if (CHECK_BTN_ALL(raw.cur.button, BTN_Z) && player->focusActor != nullptr &&
+        (s.state.action & Sm64::ACT_GROUP_MASK) == Sm64::ACT_GROUP_STATIONARY) {
+        s16 toTarget = Actor_WorldYawTowardActor(&player->actor, player->focusActor);
+        lib().set_mario_faceangle(s.marioId, toTarget * kPi / 32768.0f);
+    }
     SM64MarioInputs in = InputsFromController(play, raw, !(passA || holdA));
     Tick(TicksThisFrame(), in);
     ConvertMarioHealth(play);
     ApplyMarioToLink(player);
 
     // What Link's own logic gets to see this frame
-    u16 removed = BTN_B | BTN_Z | BTN_R;
+    u16 removed = BTN_B | BTN_R;
     if (!(passA || holdA)) {
         removed |= BTN_A;
     }
