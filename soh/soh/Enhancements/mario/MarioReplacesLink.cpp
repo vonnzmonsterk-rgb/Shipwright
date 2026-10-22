@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <libultraship/bridge/consolevariablebridge.h>
+#include <spdlog/spdlog.h>
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
@@ -740,6 +741,15 @@ void OnPlayerUpdateCommon(Player* player, Input* input) {
 
     s.handedToLink = passA || holdA || passC || assist;
     s.pendingPostUpdate = true;
+
+    if (CVarGetInteger(CVAR_MARIO("Debug"), 0) && (play->gameplayFrames % 10) == 0) {
+        s32 exitIdx = player->actor.floorPoly != nullptr
+                          ? SurfaceType_GetSceneExitIndex(&play->colCtx, player->actor.floorPoly, player->actor.floorBgId)
+                          : -1;
+        SPDLOG_INFO("[Mario] pos {:.1f} {:.1f} {:.1f} action {:08x} floorExit {} wall {} doors {} dyna {}",
+                    player->actor.world.pos.x, player->actor.world.pos.y, player->actor.world.pos.z, s.state.action,
+                    exitIdx, player->actor.wallPoly != nullptr, s.doors.size(), s.dyna.size());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -858,6 +868,39 @@ LightSetup MakeLight(PlayState* play) {
     return l;
 }
 
+// Pre-composited copies of Mario's textures over each base color they are drawn on (see DrawMario)
+struct Composite {
+    int tex;
+    uint32_t color;
+    alignas(16) uint8_t pixels[64 * 64 * 4];
+};
+constexpr int kMaxComposites = 48;
+Composite sComposites[kMaxComposites];
+int sNumComposites = 0;
+
+int CompositeSlot(int tex, const float* triColor) {
+    uint8_t r = (uint8_t)(triColor[0] * 255.0f), g = (uint8_t)(triColor[1] * 255.0f), b = (uint8_t)(triColor[2] * 255.0f);
+    uint32_t key = (r << 16) | (g << 8) | b;
+    for (int i = 0; i < sNumComposites; i++) {
+        if (sComposites[i].tex == tex && sComposites[i].color == key) {
+            return i;
+        }
+    }
+    int slot = sNumComposites < kMaxComposites ? sNumComposites++ : kMaxComposites - 1;
+    Composite& c = sComposites[slot];
+    c.tex = tex;
+    c.color = key;
+    const uint8_t* src = sTextureChunks[tex];
+    for (int p = 0; p < 64 * 64; p++) {
+        float a = src[p * 4 + 3] / 255.0f;
+        c.pixels[p * 4 + 0] = (uint8_t)(src[p * 4 + 0] * a + r * (1.0f - a));
+        c.pixels[p * 4 + 1] = (uint8_t)(src[p * 4 + 1] * a + g * (1.0f - a));
+        c.pixels[p * 4 + 2] = (uint8_t)(src[p * 4 + 2] * a + b * (1.0f - a));
+        c.pixels[p * 4 + 3] = 255;
+    }
+    return slot;
+}
+
 } // namespace
 
 // Outside the anonymous namespace: OPEN_DISPS declares OoT's frame interpolation functions at block scope,
@@ -877,27 +920,38 @@ static void DrawMario(PlayState* play, Player* player) {
     GraphicsContext* gfxCtx = play->state.gfxCtx;
     LightSetup light = MakeLight(play);
 
-    // Group triangles: index 0 is untextured, 1..11 use texture (index - 1)
-    std::vector<int> groups[kNumTextures + 1];
+    // Group triangles by texture and base color. Group 0 is untextured.
+    // LUS's combiner can't light a texture blended over a per-vertex base color in one pass, so each
+    // (texture, base color) pair is pre-composited into its own opaque texture and drawn as TEXEL0 * SHADE.
+    std::vector<std::pair<int, std::vector<int>>> groups; // (composite slot or -1, triangles)
+    std::unordered_map<int, size_t> groupIndex;
     for (int t = 0; t < numTris; t++) {
         float* uv = &sUvs[t * 6];
-        if (uv[0] == 1.0f && uv[1] == 1.0f && uv[2] == 1.0f && uv[3] == 1.0f && uv[4] == 1.0f && uv[5] == 1.0f) {
-            groups[0].push_back(t);
-            continue;
+        int slot = -1;
+        if (!(uv[0] == 1.0f && uv[1] == 1.0f && uv[2] == 1.0f && uv[3] == 1.0f && uv[4] == 1.0f && uv[5] == 1.0f)) {
+            float u = (uv[0] + uv[2] + uv[4]) / 3.0f;
+            int tex = (int)(u * kNumTextures);
+            tex = tex < 0 ? 0 : (tex >= kNumTextures ? kNumTextures - 1 : tex);
+            slot = CompositeSlot(tex, &sColors[t * 9]);
         }
-        float u = (uv[0] + uv[2] + uv[4]) / 3.0f;
-        int tex = (int)(u * kNumTextures);
-        tex = tex < 0 ? 0 : (tex >= kNumTextures ? kNumTextures - 1 : tex);
-        groups[tex + 1].push_back(t);
+        auto it = groupIndex.find(slot);
+        if (it == groupIndex.end()) {
+            groupIndex[slot] = groups.size();
+            groups.push_back({ slot, { t } });
+        } else {
+            groups[it->second].second.push_back(t);
+        }
     }
 
     // Build vertices in group order, relative to Mario's position, in SM64 units
     Vtx* vtx = (Vtx*)Graph_Alloc(gfxCtx, sizeof(Vtx) * numTris * 3);
     int written = 0;
-    int groupStart[kNumTextures + 2];
-    for (int g = 0; g <= kNumTextures; g++) {
+    std::vector<int> groupStart(groups.size() + 1);
+    for (size_t g = 0; g < groups.size(); g++) {
         groupStart[g] = written;
-        for (int t : groups[g]) {
+        int slot = groups[g].first;
+        int tex = slot >= 0 ? sComposites[slot].tex : -1;
+        for (int t : groups[g].second) {
             for (int k = 0; k < 3; k++) {
                 int vi = t * 3 + k;
                 Vtx* v = &vtx[written * 3 + k];
@@ -906,11 +960,10 @@ static void DrawMario(PlayState* play, Player* player) {
                 v->v.ob[2] = (s16)lrintf(sPositions[vi * 3 + 2] - s.state.position[2]);
                 v->v.flag = 0;
 
-                float u = sUvs[vi * 2 + 0], vv = sUvs[vi * 2 + 1];
-                if (g > 0) {
-                    float local = u * kNumTextures - (g - 1);
+                if (tex >= 0) {
+                    float local = sUvs[vi * 2 + 0] * kNumTextures - tex;
                     v->v.tc[0] = (s16)lrintf(local * 64.0f * 32.0f);
-                    v->v.tc[1] = (s16)lrintf(vv * 64.0f * 32.0f);
+                    v->v.tc[1] = (s16)lrintf(sUvs[vi * 2 + 1] * 64.0f * 32.0f);
                 } else {
                     v->v.tc[0] = v->v.tc[1] = 0;
                 }
@@ -920,19 +973,16 @@ static void DrawMario(PlayState* play, Player* player) {
                 float lit = 0.5f + 0.5f * (diffuse > 0.0f ? diffuse : 0.0f);
                 float* c = &sColors[vi * 3];
                 for (int ch = 0; ch < 3; ch++) {
-                    float col = c[ch] * light.tint[ch];
-                    // Untextured triangles get their lighting baked in; textured ones keep the base color
-                    // (blended with the texture) and get the lighting from shade alpha in the second cycle
-                    float value = (g == 0 ? col * lit : col) * 255.0f;
+                    // Untextured: base color * light. Textured: just the light (the color is in the texture).
+                    float value = (tex >= 0 ? 1.0f : c[ch]) * light.tint[ch] * lit * 255.0f;
                     v->v.cn[ch] = (u8)(value > 255.0f ? 255 : (value < 0.0f ? 0 : value));
                 }
-                float a = (g == 0 ? 1.0f : lit) * 255.0f;
-                v->v.cn[3] = (u8)(a > 255.0f ? 255 : a);
+                v->v.cn[3] = 255;
             }
             written++;
         }
     }
-    groupStart[kNumTextures + 1] = written;
+    groupStart[groups.size()] = written;
 
     OPEN_DISPS(gfxCtx);
 
@@ -944,8 +994,8 @@ static void DrawMario(PlayState* play, Player* player) {
     Matrix_Pop();
 
     gDPPipeSync(POLY_OPA_DISP++);
-    gDPSetCycleType(POLY_OPA_DISP++, G_CYC_2CYCLE);
-    gDPSetRenderMode(POLY_OPA_DISP++, G_RM_PASS, G_RM_AA_ZB_OPA_SURF2);
+    gDPSetCycleType(POLY_OPA_DISP++, G_CYC_1CYCLE);
+    gDPSetRenderMode(POLY_OPA_DISP++, G_RM_AA_ZB_OPA_SURF, G_RM_AA_ZB_OPA_SURF2);
     gSPClearGeometryMode(POLY_OPA_DISP++,
                          G_LIGHTING | G_FOG | G_CULL_BOTH | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
     gSPSetGeometryMode(POLY_OPA_DISP++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
@@ -953,26 +1003,21 @@ static void DrawMario(PlayState* play, Player* player) {
     gDPSetTexturePersp(POLY_OPA_DISP++, G_TP_PERSP);
     gDPSetTextureFilter(POLY_OPA_DISP++, G_TF_BILERP);
 
-    for (int g = 0; g <= kNumTextures; g++) {
+    for (size_t g = 0; g < groups.size(); g++) {
         int first = groupStart[g];
         int count = groupStart[g + 1] - first;
-        if (count == 0) {
-            continue;
-        }
+        int slot = groups[g].first;
 
         gDPPipeSync(POLY_OPA_DISP++);
-        if (g == 0) {
+        if (slot < 0) {
             gSPTexture(POLY_OPA_DISP++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
-            gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, SHADE, 0, 0, 0, 1, 0, 0, 0, COMBINED, 0, 0, 0, COMBINED);
+            gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, SHADE, 0, 0, 0, 1, 0, 0, 0, SHADE, 0, 0, 0, 1);
         } else {
             gSPTexture(POLY_OPA_DISP++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
-            gDPLoadTextureBlock(POLY_OPA_DISP++, sTextureChunks[g - 1], G_IM_FMT_RGBA, G_IM_SIZ_32b, 64, 64, 0,
+            gDPLoadTextureBlock(POLY_OPA_DISP++, sComposites[slot].pixels, G_IM_FMT_RGBA, G_IM_SIZ_32b, 64, 64, 0,
                                 G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMASK, G_TX_NOMASK,
                                 G_TX_NOLOD, G_TX_NOLOD);
-            // Cycle 1: blend the texture over Mario's base color by the texture's alpha
-            // Cycle 2: apply the lighting stored in shade alpha
-            gDPSetCombineLERP(POLY_OPA_DISP++, TEXEL0, SHADE, TEXEL0_ALPHA, SHADE, 0, 0, 0, 1, COMBINED, 0,
-                              SHADE_ALPHA, 0, 0, 0, 0, COMBINED);
+            gDPSetCombineLERP(POLY_OPA_DISP++, TEXEL0, 0, SHADE, 0, 0, 0, 0, 1, TEXEL0, 0, SHADE, 0, 0, 0, 0, 1);
         }
 
         for (int t = 0; t < count; t += 10) {
