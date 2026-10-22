@@ -1,0 +1,119 @@
+name: mario-windows
+# Builds Ship of Harkinian with the "Play as Mario" enhancement for Windows,
+# plus sm64.dll (libsm64, Mario's code from the SM64 decompilation).
+# The finished zip appears under this run's "Artifacts" as soh-mario-windows.
+on:
+  push:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+
+  generate-soh-otr:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: true
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y $(cat linux-build-deps/apt.txt)
+    - name: Generate soh.o2r
+      run: |
+        cmake --no-warn-unused-cli -H. -Bbuild-cmake -GNinja -DCMAKE_BUILD_TYPE:STRING=Release -DSOH_TOOLS_ONLY=ON
+        cmake --build build-cmake --config Release --target GenerateSohOtr -j4
+    - uses: actions/upload-artifact@v7
+      with:
+        name: soh.o2r
+        path: soh.o2r
+        retention-days: 3
+
+  build-sm64-dll:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v7
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: make python mingw-w64-x86_64-gcc
+    - name: Build sm64.dll
+      working-directory: libsm64
+      run: |
+        make lib -j4 LDFLAGS="-lm -shared -static"
+        ls -la dist
+    - uses: actions/upload-artifact@v7
+      with:
+        name: sm64.dll
+        path: libsm64/dist/sm64.dll
+        retention-days: 3
+
+  build-windows:
+    needs: [generate-soh-otr, build-sm64-dll]
+    runs-on: windows-latest
+    steps:
+    - name: Install dependencies
+      run: choco install ninja -y
+    - uses: actions/checkout@v7
+      with:
+        submodules: true
+    - name: Restore Cached VCPKG folder
+      id: restore-cache-vcpkg
+      uses: actions/cache/restore@v5
+      with:
+        key: ${{ runner.os }}-vcpkg-${{ github.ref }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-${{ github.ref }}-
+          ${{ runner.os }}-vcpkg-
+        path: vcpkg
+    - uses: TheMrMilchmann/setup-msvc-dev@v4
+      with:
+        arch: x64
+    - uses: actions/download-artifact@v8
+      with:
+        name: soh.o2r
+        path: build-windows/soh
+    - name: Build SoH
+      env:
+        VCPKG_ROOT: ${{github.workspace}}/vcpkg
+      run: |
+        cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE:STRING=Release
+        cmake --build build-windows --config Release --parallel 4
+        (cd build-windows && cpack)
+        cd ..
+        mv _packages/*.zip _packages/soh-windows.zip
+    - name: Unzip package
+      run: Expand-Archive -Path _packages/soh-windows.zip -DestinationPath soh-mario-windows
+    - uses: actions/download-artifact@v8
+      with:
+        name: sm64.dll
+        path: soh-mario-windows
+    - name: Add instructions
+      run: |
+        @"
+        Ship of Harkinian + Mario (Play as Mario)
+
+        1. Put your Ocarina of Time ROM in this folder (any version Ship of Harkinian supports).
+        2. Put your Super Mario 64 (USA) ROM in this folder and rename it to: sm64.us.z64
+        3. Run soh.exe. The first launch converts your OoT ROM, which takes a minute.
+        4. Press F1 (or Back/Select on a controller) to open the menu, go to
+           Enhancements > Super Mario 64 and tick "Play as Mario".
+
+        Controls: A jump, B punch/kick/dive, Z or R crouch / ground pound / slide kick,
+        C buttons use Link's items. A still talks and opens doors/chests when the A prompt says so.
+        Walk into ladders, vines and crawlspaces to use them.
+        "@ | Out-File -Encoding utf8 soh-mario-windows/README-MARIO.txt
+    - uses: actions/upload-artifact@v7
+      with:
+        name: soh-mario-windows
+        path: soh-mario-windows
+    - name: Save Cache VCPKG folder
+      if: always()
+      uses: actions/cache/save@v5
+      with:
+        key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
+        path: vcpkg

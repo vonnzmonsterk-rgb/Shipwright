@@ -1,0 +1,1 @@
+libsm64 vendored from https://github.com/libsm64/libsm64 (fd11813), with import-mario-geo.py taught to read a local sm64 decomp checkout via SM64_DECOMP_DIR.
