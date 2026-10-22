@@ -83,8 +83,16 @@ jobs:
       env:
         VCPKG_ROOT: ${{github.workspace}}/vcpkg
       run: |
-        cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE:STRING=Release
-        cmake --build build-windows --config Release --parallel 4
+        cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE:STRING=Release 2>&1 | Tee-Object -FilePath configure.log
+        if ($LASTEXITCODE -ne 0) {
+          Select-String -Path configure.log -Pattern 'Error|error' | Select-Object -First 30 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+          exit 1
+        }
+        cmake --build build-windows --config Release --parallel 4 -- -k 0 2>&1 | Tee-Object -FilePath build.log
+        if ($LASTEXITCODE -ne 0) {
+          Select-String -Path build.log -Pattern ' error |error:|: fatal|FAILED:|unresolved external' | Select-Object -First 45 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+          exit 1
+        }
         (cd build-windows && cpack)
         cd ..
         mv _packages/*.zip _packages/soh-windows.zip
