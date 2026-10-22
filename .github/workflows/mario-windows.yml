@@ -39,12 +39,14 @@ jobs:
     - uses: actions/checkout@v7
     - uses: msys2/setup-msys2@v2
       with:
-        msystem: MINGW64
-        install: make python mingw-w64-x86_64-gcc
+        msystem: UCRT64
+        install: make python mingw-w64-ucrt-x86_64-gcc
     - name: Build sm64.dll
       working-directory: libsm64
       run: |
-        make lib -j4 LDFLAGS="-lm -shared -static"
+        set -x
+        which gcc python3 make
+        make lib -j4 CC=gcc LDFLAGS="-lm -shared -static"
         ls -la dist
     - uses: actions/upload-artifact@v7
       with:
